@@ -15,7 +15,7 @@ use super::{super::utils::to_descriptor_value, descriptor::BLEDescriptor};
 use crate::{
     Error, Result,
     api::{Characteristic, WriteType},
-    winrtble::utils,
+    winrtble::{errors, utils},
 };
 
 use log::{debug, trace};
@@ -27,7 +27,7 @@ use windows::{
         BluetoothCacheMode,
         GenericAttributeProfile::{
             GattCharacteristic, GattClientCharacteristicConfigurationDescriptorValue,
-            GattCommunicationStatus, GattValueChangedEventArgs, GattWriteOption,
+            GattValueChangedEventArgs, GattWriteOption,
         },
     },
     Foundation::TypedEventHandler,
@@ -67,16 +67,18 @@ impl BLECharacteristic {
     pub async fn write_value(&self, data: &[u8], write_type: WriteType) -> Result<()> {
         let writer = DataWriter::new()?;
         writer.WriteBytes(data)?;
-        let operation = self
-            .characteristic
-            .WriteValueWithOptionAsync(&writer.DetachBuffer()?, write_type.into())?;
-        let result = operation.into_future().await?;
-        if result == GattCommunicationStatus::Success {
-            Ok(())
+        if write_type == WriteType::WithResponse {
+            let operation = self
+                .characteristic
+                .WriteValueWithResultAndOptionAsync(&writer.DetachBuffer()?, write_type.into())?;
+            let result = operation.into_future().await?;
+            errors::check_gatt("write", &result)
         } else {
-            Err(Error::Other(
-                format!("Windows UWP threw error on write: {:?}", result).into(),
-            ))
+            let operation = self
+                .characteristic
+                .WriteValueWithOptionAsync(&writer.DetachBuffer()?, write_type.into())?;
+            let result = operation.into_future().await?;
+            errors::check_gatt("write", &result)
         }
     }
 
@@ -86,18 +88,13 @@ impl BLECharacteristic {
             .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)?
             .into_future()
             .await?;
-        if result.Status()? == GattCommunicationStatus::Success {
-            let value = result.Value()?;
-            let reader = DataReader::FromBuffer(&value)?;
-            let len = reader.UnconsumedBufferLength()? as usize;
-            let mut input = vec![0u8; len];
-            reader.ReadBytes(&mut input[0..len])?;
-            Ok(input)
-        } else {
-            Err(Error::Other(
-                format!("Windows UWP threw error on read: {:?}", result).into(),
-            ))
-        }
+        errors::check_gatt("read", &result)?;
+        let value = result.Value()?;
+        let reader = DataReader::FromBuffer(&value)?;
+        let len = reader.UnconsumedBufferLength()? as usize;
+        let mut input = vec![0u8; len];
+        reader.ReadBytes(&mut input[0..len])?;
+        Ok(input)
     }
 
     pub async fn subscribe(&mut self, on_value_changed: NotifiyEventHandler) -> Result<()> {
@@ -124,19 +121,13 @@ impl BLECharacteristic {
             return Err(Error::NotSupported("Can not subscribe to attribute".into()));
         }
 
-        let status = self
+        let result = self
             .characteristic
-            .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
+            .WriteClientCharacteristicConfigurationDescriptorWithResultAsync(config)?
             .into_future()
             .await?;
-        trace!("subscribe {:?}", status);
-        if status == GattCommunicationStatus::Success {
-            Ok(())
-        } else {
-            Err(Error::Other(
-                format!("Windows UWP threw error on subscribe: {:?}", status).into(),
-            ))
-        }
+        trace!("subscribe {:?}", result.Status()?);
+        errors::check_gatt("subscribe", &result)
     }
 
     pub async fn unsubscribe(&mut self) -> Result<()> {
@@ -145,19 +136,13 @@ impl BLECharacteristic {
         }
         self.notify_token = None;
         let config = GattClientCharacteristicConfigurationDescriptorValue::None;
-        let status = self
+        let result = self
             .characteristic
-            .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
+            .WriteClientCharacteristicConfigurationDescriptorWithResultAsync(config)?
             .into_future()
             .await?;
-        trace!("unsubscribe {:?}", status);
-        if status == GattCommunicationStatus::Success {
-            Ok(())
-        } else {
-            Err(Error::Other(
-                format!("Windows UWP threw error on unsubscribe: {:?}", status).into(),
-            ))
-        }
+        trace!("unsubscribe {:?}", result.Status()?);
+        errors::check_gatt("unsubscribe", &result)
     }
 
     pub fn uuid(&self) -> Uuid {
