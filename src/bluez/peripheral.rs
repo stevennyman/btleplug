@@ -13,7 +13,10 @@ use serde_cr as serde;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::{self, Display, Formatter};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::sleep;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::api::{
@@ -61,6 +64,21 @@ pub struct Peripheral {
     device: DeviceId,
     mac_address: BDAddr,
     services: Arc<Mutex<HashMap<Uuid, ServiceInternal>>>,
+    gatt_lock: Arc<AsyncMutex<()>>,
+}
+
+const WRITE_SEND_FAILURE_RETRIES: usize = 3;
+const WRITE_SEND_FAILURE_DELAY: Duration = Duration::from_millis(20);
+
+fn gatt_lock_for_device(device: &DeviceId) -> Arc<AsyncMutex<()>> {
+    static GATT_LOCKS: OnceLock<Mutex<HashMap<DeviceId, Arc<AsyncMutex<()>>>>> =
+        OnceLock::new();
+    let locks = GATT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks.lock().unwrap();
+    guard
+        .entry(device.clone())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
 }
 
 fn get_characteristic<'a>(
@@ -88,11 +106,13 @@ fn get_characteristic<'a>(
 
 impl Peripheral {
     pub(crate) fn new(session: BluetoothSession, device: DeviceInfo) -> Self {
+        let gatt_lock = gatt_lock_for_device(&device.id);
         Peripheral {
             session,
             device: device.id,
             mac_address: device.mac_address.into(),
             services: Arc::new(Mutex::new(HashMap::new())),
+            gatt_lock,
         }
     }
 
@@ -249,14 +269,37 @@ impl api::Peripheral for Peripheral {
             write_type: Some(write_type.into()),
             ..Default::default()
         };
-        Ok(self
-            .session
-            .write_characteristic_value_with_options(&characteristic_info.id, data, options)
-            .await?)
+        let _guard = self.gatt_lock.lock().await;
+        let mut last_error = None;
+        for attempt in 0..WRITE_SEND_FAILURE_RETRIES {
+            match self
+                .session
+                .write_characteristic_value_with_options(&characteristic_info.id, data, options)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if is_failed_to_send_message(&err)
+                        && attempt + 1 < WRITE_SEND_FAILURE_RETRIES
+                    {
+                        last_error = Some(err);
+                        sleep(WRITE_SEND_FAILURE_DELAY).await;
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+
+        Err(match last_error {
+            Some(err) => err.into(),
+            None => Error::RuntimeError("write failed without error".to_string()),
+        })
     }
 
     async fn read(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {
         let characteristic_info = self.characteristic_info(characteristic)?;
+        let _guard = self.gatt_lock.lock().await;
         Ok(self
             .session
             .read_characteristic_value(&characteristic_info.id)
@@ -265,11 +308,13 @@ impl api::Peripheral for Peripheral {
 
     async fn subscribe(&self, characteristic: &Characteristic) -> Result<()> {
         let characteristic_info = self.characteristic_info(characteristic)?;
+        let _guard = self.gatt_lock.lock().await;
         Ok(self.session.start_notify(&characteristic_info.id).await?)
     }
 
     async fn unsubscribe(&self, characteristic: &Characteristic) -> Result<()> {
         let characteristic_info = self.characteristic_info(characteristic)?;
+        let _guard = self.gatt_lock.lock().await;
         Ok(self.session.stop_notify(&characteristic_info.id).await?)
     }
 
@@ -292,6 +337,7 @@ impl api::Peripheral for Peripheral {
 
     async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
         let descriptor_info = self.descriptor_info(descriptor)?;
+        let _guard = self.gatt_lock.lock().await;
         Ok(self
             .session
             .write_descriptor_value(&descriptor_info.id, data)
@@ -300,12 +346,23 @@ impl api::Peripheral for Peripheral {
 
     async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
         let descriptor_info = self.descriptor_info(descriptor)?;
+        let _guard = self.gatt_lock.lock().await;
         Ok(self
             .session
             .read_descriptor_value(&descriptor_info.id)
             .await?)
     }
 }
+
+fn is_failed_to_send_message(error: &bluez_async::BluetoothError) -> bool {
+    match error {
+        bluez_async::BluetoothError::DbusError(dbus_error) => dbus_error
+            .message()
+            .is_some_and(|msg| msg.contains("Failed to send message")),
+        _ => false,
+    }
+}
+
 
 async fn value_notification_async(
     event: BluetoothEvent,
