@@ -4,7 +4,7 @@ use bluez_async::{
     CharacteristicInfo, DescriptorInfo, DeviceId, DeviceInfo, MacAddress, ServiceInfo,
     WriteOptions,
 };
-use futures::future::{join_all, ready};
+use futures::future::join_all;
 use futures::stream::{Stream, StreamExt};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -277,11 +277,14 @@ impl api::Peripheral for Peripheral {
         let device_id = self.device.clone();
         let events = self.session.device_event_stream(&device_id).await?;
         let services = self.services.clone();
+        let session = self.session.clone();
         Ok(Box::pin(events.filter_map(move |event| {
-            ready(value_notification(event, &device_id, services.clone()))
+            let services = services.clone();
+            let session = session.clone();
+            let device_id = device_id.clone();
+            async move { value_notification_async(event, &device_id, services, session).await }
         })))
     }
-
     async fn read_rssi(&self) -> Result<i16> {
         let device_info = self.device_info().await?;
         device_info.rssi.ok_or(Error::NotConnected)
@@ -304,21 +307,33 @@ impl api::Peripheral for Peripheral {
     }
 }
 
-fn value_notification(
+async fn value_notification_async(
     event: BluetoothEvent,
     device_id: &DeviceId,
     services: Arc<Mutex<HashMap<Uuid, ServiceInternal>>>,
+    session: BluetoothSession,
 ) -> Option<ValueNotification> {
     match event {
         BluetoothEvent::Characteristic {
             id,
             event: CharacteristicEvent::Value { value },
         } if id.service().device() == *device_id => {
-            let services = services.lock().unwrap();
-            let (charac, service) = find_characteristic_by_id(&services, id.clone())?;
+            if let Ok(services_guard) = services.lock() {
+                if let Some((charac, service)) =
+                    find_characteristic_by_id(&services_guard, id.clone())
+                {
+                    return Some(ValueNotification {
+                        uuid: charac.uuid,
+                        service_uuid: service.uuid,
+                        value,
+                    });
+                }
+            }
+            let characteristic_info = session.get_characteristic_info(&id).await.ok()?;
+            let service_info = session.get_service_info(&id.service()).await.ok()?;
             Some(ValueNotification {
-                uuid: charac.uuid,
-                service_uuid: service.uuid,
+                uuid: characteristic_info.uuid,
+                service_uuid: service_info.uuid,
                 value,
             })
         }
