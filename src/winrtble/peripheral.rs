@@ -45,9 +45,11 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use std::sync::Weak;
-use windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic;
 use windows::Devices::Bluetooth::{Advertisement::*, BluetoothAddressType};
 use windows::core::GUID;
+use windows::{
+    Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic, Storage::Streams::DataReader,
+};
 
 #[cfg_attr(
     feature = "serde",
@@ -87,6 +89,7 @@ struct Shared {
     latest_manufacturer_data: RwLock<HashMap<u16, Vec<u8>>>,
     latest_service_data: RwLock<HashMap<Uuid, Vec<u8>>>,
     services: RwLock<HashSet<Uuid>>,
+    appearance: RwLock<Option<u16>>,
     class: RwLock<Option<u32>>,
 }
 
@@ -110,6 +113,7 @@ impl Peripheral {
                 latest_manufacturer_data: RwLock::new(HashMap::new()),
                 latest_service_data: RwLock::new(HashMap::new()),
                 services: RwLock::new(HashSet::new()),
+                appearance: RwLock::new(None),
                 class: RwLock::new(None),
             }),
         }
@@ -135,6 +139,7 @@ impl Peripheral {
                 .iter()
                 .copied()
                 .collect(),
+            appearance: self.shared.appearance.read().unwrap().clone(),
             class: *self.shared.class.read().unwrap(),
         }
     }
@@ -301,6 +306,16 @@ impl Peripheral {
                     id: self.shared.address.into(),
                     rssi,
                 });
+            }
+        }
+        if let Ok(appearance_section) = advertisement.GetSectionsByType(0x19) {
+            if appearance_section.Size().unwrap_or_default() > 0 {
+                let appearance_section = appearance_section.GetAt(0).unwrap().Data().unwrap();
+                let reader = DataReader::FromBuffer(&appearance_section).unwrap();
+                if let Ok(appearance_value) = reader.ReadUInt16() {
+                    let mut appearance_guard = self.shared.appearance.write().unwrap();
+                    *appearance_guard = Some(appearance_value);
+                }
             }
         }
     }
