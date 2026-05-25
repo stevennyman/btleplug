@@ -161,6 +161,7 @@ impl api::Peripheral for Peripheral {
             manufacturer_data: device_info.manufacturer_data,
             service_data: device_info.service_data,
             services: device_info.services,
+            appearance: device_info.appearance,
             class: device_info.class,
         }))
     }

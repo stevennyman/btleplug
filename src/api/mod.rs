@@ -201,6 +201,9 @@ pub struct PeripheralProperties {
     pub service_data: HashMap<Uuid, Vec<u8>>,
     /// Advertised services for this device
     pub services: Vec<Uuid>,
+    // Advertised appearance value for the device. Not populated on CoreBluetooth.
+    pub appearance: Option<u16>,
+    // Class of device. Only populated on bluez.
     pub class: Option<u32>,
 }
 
