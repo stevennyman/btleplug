@@ -102,6 +102,16 @@ pub fn to_char_props(props: &GattCharacteristicProperties) -> CharPropFlags {
     {
         flags |= CharPropFlags::EXTENDED_PROPERTIES;
     }
+    if *props & GattCharacteristicProperties::ReliableWrites
+        != GattCharacteristicProperties::None
+    {
+        flags |= CharPropFlags::RELIABLE_WRITE;
+    }
+    if *props & GattCharacteristicProperties::WritableAuxiliaries
+        != GattCharacteristicProperties::None
+    {
+        flags |= CharPropFlags::WRITABLE_AUXILIARIES;
+    }
     flags
 }
 
