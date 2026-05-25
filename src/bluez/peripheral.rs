@@ -439,6 +439,12 @@ impl From<CharacteristicFlags> for CharPropFlags {
         if flags.contains(CharacteristicFlags::EXTENDED_PROPERTIES) {
             result.insert(CharPropFlags::EXTENDED_PROPERTIES);
         }
+        if flags.contains(CharacteristicFlags::RELIABLE_WRITE) {
+            result.insert(CharPropFlags::RELIABLE_WRITE);
+        }
+        if flags.contains(CharacteristicFlags::WRITABLE_AUXILIARIES) {
+            result.insert(CharPropFlags::WRITABLE_AUXILIARIES);
+        }
         result
     }
 }
