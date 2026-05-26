@@ -308,7 +308,9 @@ impl Peripheral {
                 });
             }
         }
-        if let Ok(appearance_section) = advertisement.GetSectionsByType(0x19) {
+        if let Ok(appearance_section) = advertisement
+            .GetSectionsByType(BluetoothLEAdvertisementDataTypes::Appearance().unwrap())
+        {
             if appearance_section.Size().unwrap_or_default() > 0 {
                 let appearance_section = appearance_section.GetAt(0).unwrap().Data().unwrap();
                 let reader = DataReader::FromBuffer(&appearance_section).unwrap();
