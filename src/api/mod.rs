@@ -96,6 +96,77 @@ pub struct ValueNotification {
     pub value: Vec<u8>,
 }
 
+/// The kind of pairing ceremony the OS is asking the application to participate in.
+///
+/// This is currently only emitted on Windows. Other supported platforms (macOS/iOS, Linux,
+/// Android) handle BLE pairing entirely inside the OS Bluetooth stack and never surface it to
+/// the host application, so [`Peripheral::pairing_requests`] simply returns
+/// [`Error::NotSupported`](crate::Error::NotSupported) there.
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PairingRequestKind {
+    /// Simply confirm (yes/no) that pairing should proceed. No PIN is involved.
+    ConfirmOnly,
+    /// A PIN is provided here; the user should confirm it matches what's shown on the
+    /// peripheral, then respond with [`PairingResponse::Accept`] or
+    /// [`PairingResponse::Reject`].
+    ConfirmPinMatch(String),
+    /// A PIN is provided here; the user should enter it on the peripheral itself. No response
+    /// is required beyond acknowledging the request, typically with [`PairingResponse::Accept`].
+    DisplayPin(String),
+    /// A PIN is displayed on the peripheral; the user must type it in and the application
+    /// should respond with [`PairingResponse::Pin`].
+    ProvidePin,
+}
+
+/// Identifies a single pairing request, so a response can be correlated with the request it's
+/// answering. This guards against a stale response arriving after the request it was meant for
+/// has already been resolved or superseded.
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct PairingRequestId(pub(crate) u64);
+
+/// A single pairing request emitted on the [`Peripheral::pairing_requests`] stream. Respond to
+/// it with [`Peripheral::respond_to_pairing_request`], passing back the same `id`.
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairingRequest {
+    /// Identifies this request. Pass this back to
+    /// [`Peripheral::respond_to_pairing_request`].
+    pub id: PairingRequestId,
+    /// The kind of pairing ceremony being requested.
+    pub kind: PairingRequestKind,
+}
+
+/// The application's response to a [`PairingRequest`].
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PairingResponse {
+    /// Accept the pairing request. Used for [`PairingRequestKind::ConfirmOnly`] and
+    /// [`PairingRequestKind::ConfirmPinMatch`].
+    Accept,
+    /// Reject the pairing request.
+    Reject,
+    /// Provide a PIN typed by the user. Used for [`PairingRequestKind::ProvidePin`].
+    Pin(String),
+}
+
 bitflags! {
     /// A set of properties that indicate what operations are supported by a Characteristic.
     #[derive(Default, Debug, PartialEq, Eq, Ord, PartialOrd, Clone, Copy)]
@@ -377,6 +448,46 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     /// return a cached scan value).
     async fn read_rssi(&self) -> Result<i16> {
         Err(crate::Error::NotSupported("read_rssi".to_string()))
+    }
+
+    /// Returns a stream of pairing requests from the OS. The application should respond to
+    /// each one via [`respond_to_pairing_request`](Peripheral::respond_to_pairing_request).
+    ///
+    /// This is currently only meaningful on Windows, where the application is responsible for
+    /// driving the pairing ceremony itself. Other platforms manage pairing entirely inside the
+    /// OS Bluetooth stack and never surface it here, so this returns `Err(NotSupported)` there.
+    ///
+    /// Subscribe to this stream before triggering any operation that might require pairing
+    /// (ideally right after [`connect`](Peripheral::connect)) - a request that fires before
+    /// anyone is listening will go unanswered and the underlying `pair`/retried operation will
+    /// eventually time out.
+    async fn pairing_requests(&self) -> Result<Pin<Box<dyn Stream<Item = PairingRequest> + Send>>> {
+        Err(crate::Error::NotSupported("pairing_requests".to_string()))
+    }
+
+    /// Responds to a pairing request previously received on the
+    /// [`pairing_requests`](Peripheral::pairing_requests) stream. `id` must match the request
+    /// being answered; a mismatched or already-resolved id returns an error.
+    async fn respond_to_pairing_request(
+        &self,
+        _id: PairingRequestId,
+        _response: PairingResponse,
+    ) -> Result<()> {
+        Err(crate::Error::NotSupported(
+            "respond_to_pairing_request".to_string(),
+        ))
+    }
+
+    /// Explicitly initiates pairing with this peripheral. Returns `Ok(())` immediately if
+    /// already paired. While pairing is in progress, requests will be emitted on
+    /// [`pairing_requests`](Peripheral::pairing_requests) for the application to respond to.
+    ///
+    /// You generally don't need to call this directly - `read`/`write`/`subscribe` will
+    /// trigger pairing automatically on platforms that need it if an operation fails because
+    /// the link isn't authenticated/encrypted yet. Call this explicitly if you'd rather pair
+    /// proactively (e.g. right after connecting) for more predictable UX.
+    async fn pair(&self) -> Result<()> {
+        Err(crate::Error::NotSupported("pair".to_string()))
     }
 }
 

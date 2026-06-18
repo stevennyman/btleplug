@@ -20,6 +20,7 @@ use windows::{
         GattCharacteristicProperties, GattClientCharacteristicConfigurationDescriptorValue,
         GattCommunicationStatus,
     },
+    Devices::Enumeration::DevicePairingResultStatus,
     Storage::Streams::{DataReader, IBuffer},
 };
 
@@ -34,6 +35,23 @@ pub fn to_error(status: GattCommunicationStatus) -> Result<()> {
         Err(Error::NotSupported("ProtocolError".to_string()))
     } else {
         Err(Error::Other("Communication Error:".to_string().into()))
+    }
+}
+
+/// Maps a Windows pairing result status to a btleplug [`Error`]. `Paired` and `AlreadyPaired`
+/// are treated as success; everything else (rejection, timeout, hardware failure, etc.) is
+/// folded into [`Error::Other`] with the status preserved in the message for debugging, since
+/// the long tail of `DevicePairingResultStatus` variants doesn't map cleanly onto btleplug's
+/// existing error categories.
+pub fn pairing_status_to_error(status: DevicePairingResultStatus) -> Result<()> {
+    if status == DevicePairingResultStatus::Paired
+        || status == DevicePairingResultStatus::AlreadyPaired
+    {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            format!("Pairing failed with status {:?}", status).into(),
+        ))
     }
 }
 

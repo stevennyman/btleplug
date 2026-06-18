@@ -12,14 +12,11 @@
 // Copyright (c) 2014 The Rust Project Developers
 
 use super::super::utils;
-use crate::{Error, Result, api::Descriptor};
+use crate::{Result, api::Descriptor};
 use std::future::IntoFuture;
 use uuid::Uuid;
 use windows::{
-    Devices::Bluetooth::{
-        BluetoothCacheMode,
-        GenericAttributeProfile::{GattCommunicationStatus, GattDescriptor},
-    },
+    Devices::Bluetooth::{BluetoothCacheMode, GenericAttributeProfile::GattDescriptor},
     Storage::Streams::{DataReader, DataWriter},
 };
 
@@ -51,13 +48,7 @@ impl BLEDescriptor {
         writer.WriteBytes(data)?;
         let operation = self.descriptor.WriteValueAsync(&writer.DetachBuffer()?)?;
         let result = operation.into_future().await?;
-        if result == GattCommunicationStatus::Success {
-            Ok(())
-        } else {
-            Err(Error::Other(
-                format!("Windows UWP threw error on write descriptor: {:?}", result).into(),
-            ))
-        }
+        utils::to_error(result)
     }
 
     pub async fn read_value(&self) -> Result<Vec<u8>> {
@@ -66,17 +57,13 @@ impl BLEDescriptor {
             .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)?
             .into_future()
             .await?;
-        if result.Status()? == GattCommunicationStatus::Success {
-            let value = result.Value()?;
-            let reader = DataReader::FromBuffer(&value)?;
-            let len = reader.UnconsumedBufferLength()? as usize;
-            let mut input = vec![0u8; len];
-            reader.ReadBytes(&mut input[0..len])?;
-            Ok(input)
-        } else {
-            Err(Error::Other(
-                format!("Windows UWP threw error on read: {:?}", result).into(),
-            ))
-        }
+        utils::to_error(result.Status()?)?;
+
+        let value = result.Value()?;
+        let reader = DataReader::FromBuffer(&value)?;
+        let len = reader.UnconsumedBufferLength()? as usize;
+        let mut input = vec![0u8; len];
+        reader.ReadBytes(&mut input[0..len])?;
+        Ok(input)
     }
 }
