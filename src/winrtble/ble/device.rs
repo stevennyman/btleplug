@@ -13,7 +13,11 @@
 
 use std::time::Duration;
 
-use crate::{Error, Result, api::BDAddr, winrtble::utils};
+use crate::{
+    Error, Result,
+    api::{BDAddr, PairingRequestKind},
+    winrtble::utils,
+};
 use log::{debug, trace, warn};
 use tokio::time::timeout;
 use windows::{
@@ -25,7 +29,11 @@ use windows::{
             GattDeviceServicesResult, GattSession,
         },
     },
-    Foundation::TypedEventHandler,
+    Devices::Enumeration::{
+        DeviceInformationCustomPairing, DevicePairingKinds, DevicePairingProtectionLevel,
+        DevicePairingRequestedEventArgs,
+    },
+    Foundation::{Deferral, TypedEventHandler},
 };
 
 /// Timeout for uncached GATT operations before falling back to cached mode.
@@ -34,6 +42,14 @@ const GATT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type ConnectedEventHandler = Box<dyn Fn(bool) + Send>;
 pub type MaxPduSizeChangedEventHandler = Box<dyn Fn(u16) + Send>;
+
+/// Called whenever Windows fires a `PairingRequested` event during an in-progress pairing
+/// ceremony. The handler must stash the `DevicePairingRequestedEventArgs`/`Deferral` somewhere
+/// it can be retrieved later (see `Shared::pending_pairing` in `winrtble/peripheral.rs`) - they
+/// can't be reconstructed from a plain enum value, and `Accept`/`AcceptWithPin` must be called
+/// on this exact `args` instance before completing the deferral.
+pub type PairingRequestedHandler =
+    Box<dyn Fn(PairingRequestKind, DevicePairingRequestedEventArgs, Deferral) + Send>;
 
 pub struct BLEDevice {
     device: BluetoothLEDevice,
@@ -278,6 +294,83 @@ impl BLEDevice {
         }
         Ok(self.services.as_slice())
     }
+
+    /// Pairs with the device if it isn't already paired. `on_pairing_requested` is invoked
+    /// (possibly multiple times, once per ceremony step) whenever Windows needs the application
+    /// to confirm a PIN or otherwise acknowledge the pairing request. This call doesn't return
+    /// until the ceremony completes one way or another - successfully, rejected, or timed out -
+    /// since the corresponding `PairAsync` WinRT call doesn't resolve until then.
+    pub async fn start_pairing(&self, on_pairing_requested: PairingRequestedHandler) -> Result<()> {
+        let winrt_error = |e| Error::Other(format!("{:?}", e).into());
+
+        let device_information = self.device.DeviceInformation().map_err(winrt_error)?;
+        let pairing = device_information.Pairing().map_err(winrt_error)?;
+
+        if pairing.IsPaired().unwrap_or(false) {
+            debug!("start_pairing: already paired, nothing to do");
+            return Ok(());
+        }
+
+        let custom_pairing = pairing.Custom().map_err(winrt_error)?;
+        let pairing_requested_token =
+            register_pairing_requested_handler(&custom_pairing, on_pairing_requested)
+                .map_err(winrt_error)?;
+
+        // Only request the ceremony kinds we actually know how to drive a response for.
+        // ProvidePasswordCredential is intentionally excluded - it's effectively unused for BLE
+        // peripherals and we don't have a response path for it.
+        let kinds = DevicePairingKinds::ConfirmOnly
+            | DevicePairingKinds::DisplayPin
+            | DevicePairingKinds::ProvidePin
+            | DevicePairingKinds::ConfirmPinMatch;
+
+        let pair_result = custom_pairing
+            .PairWithProtectionLevelAsync(kinds, DevicePairingProtectionLevel::Default)
+            .map_err(winrt_error)?
+            .await
+            .map_err(winrt_error);
+
+        // Best-effort cleanup. A failure here shouldn't mask the actual pairing result, and
+        // there's nothing useful we can do about it beyond logging.
+        if let Err(err) = custom_pairing.RemovePairingRequested(pairing_requested_token) {
+            debug!("start_pairing: remove_pairing_requested {:?}", err);
+        }
+
+        let status = pair_result?.Status().map_err(winrt_error)?;
+        utils::pairing_status_to_error(status)
+    }
+}
+
+fn register_pairing_requested_handler(
+    custom_pairing: &DeviceInformationCustomPairing,
+    on_pairing_requested: PairingRequestedHandler,
+) -> windows::core::Result<i64> {
+    let pairing_requested_handler = TypedEventHandler::<
+        DeviceInformationCustomPairing,
+        DevicePairingRequestedEventArgs,
+    >::new(move |_, args| {
+        if let Some(args) = args.as_ref() {
+            let deferral = args.GetDeferral()?;
+            let kind = match args.PairingKind() {
+                Ok(DevicePairingKinds::DisplayPin) => PairingRequestKind::DisplayPin(
+                    args.Pin().map(|pin| pin.to_string()).unwrap_or_default(),
+                ),
+                Ok(DevicePairingKinds::ConfirmPinMatch) => PairingRequestKind::ConfirmPinMatch(
+                    args.Pin().map(|pin| pin.to_string()).unwrap_or_default(),
+                ),
+                Ok(DevicePairingKinds::ProvidePin) => PairingRequestKind::ProvidePin,
+                // ConfirmOnly, and anything we don't explicitly recognize, is treated as
+                // a plain yes/no confirmation.
+                _ => PairingRequestKind::ConfirmOnly,
+            };
+            on_pairing_requested(kind, args.clone(), deferral);
+        }
+        Ok(())
+    });
+
+    // TypedEventHandler wraps a raw COM pointer and is not Send. Keep it inside this synchronous
+    // helper so it cannot be captured by the async state machine in `start_pairing`.
+    custom_pairing.PairingRequested(&pairing_requested_handler)
 }
 
 impl Drop for BLEDevice {

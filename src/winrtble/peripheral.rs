@@ -19,11 +19,11 @@ use crate::{
     Error, Result,
     api::{
         self, AddressType, BDAddr, CentralEvent, Characteristic, ConnectionParameterPreset,
-        ConnectionParameters, Descriptor, Peripheral as ApiPeripheral, PeripheralProperties,
-        Service, ValueNotification, WriteType,
+        ConnectionParameters, Descriptor, PairingRequest, PairingRequestId, PairingResponse,
+        Peripheral as ApiPeripheral, PeripheralProperties, Service, ValueNotification, WriteType,
         bleuuid::{uuid_from_u16, uuid_from_u32},
     },
-    common::{adapter_manager::AdapterManager, util::notifications_stream_from_broadcast_receiver},
+    common::{adapter_manager::AdapterManager, util::stream_from_broadcast_receiver},
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -38,18 +38,18 @@ use std::{
     convert::TryInto,
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU16, Ordering},
-    sync::{Arc, RwLock},
+    sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+    sync::{Arc, Mutex, RwLock},
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use std::sync::Weak;
-use windows::Devices::Bluetooth::{Advertisement::*, BluetoothAddressType};
-use windows::core::GUID;
-use windows::{
-    Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic, Storage::Streams::DataReader,
-};
+use windows::Devices::Bluetooth::{Advertisement::*, BluetoothAddressType, GenericAttributeProfile::GattCharacteristic};
+use windows::Storage::Streams::DataReader;
+use windows::Devices::Enumeration::DevicePairingRequestedEventArgs;
+use windows::Foundation::Deferral;
+use windows::core::{GUID, HSTRING};
 
 #[cfg_attr(
     feature = "serde",
@@ -79,6 +79,16 @@ struct Shared {
     connected: AtomicBool,
     ble_services: DashMap<Uuid, BLEService>,
     notifications_channel: broadcast::Sender<ValueNotification>,
+    pairing_channel: broadcast::Sender<PairingRequest>,
+    // Holds the live WinRT handles for whichever pairing request is currently awaiting a
+    // response from the application. `Accept`/`AcceptWithPin` must be called on this exact
+    // `DevicePairingRequestedEventArgs` before completing its `Deferral` - they can't be
+    // reconstructed from the `PairingRequestId` alone.
+    pending_pairing: Mutex<Option<(PairingRequestId, DevicePairingRequestedEventArgs, Deferral)>>,
+    next_pairing_id: AtomicU64,
+    // Serializes pairing attempts so concurrent read/write/subscribe calls that all hit
+    // PermissionDenied at once don't each kick off their own PairAsync ceremony.
+    pairing_lock: tokio::sync::Mutex<()>,
 
     // Mutable, advertised, state...
     address_type: RwLock<Option<AddressType>>,
@@ -96,6 +106,7 @@ struct Shared {
 impl Peripheral {
     pub(crate) fn new(adapter: Weak<AdapterManager<Self>>, address: BDAddr) -> Self {
         let (broadcast_sender, _) = broadcast::channel(16);
+        let (pairing_sender, _) = broadcast::channel(4);
         Peripheral {
             shared: Arc::new(Shared {
                 adapter,
@@ -105,6 +116,10 @@ impl Peripheral {
                 connected: AtomicBool::new(false),
                 ble_services: DashMap::new(),
                 notifications_channel: broadcast_sender,
+                pairing_channel: pairing_sender,
+                pending_pairing: Mutex::new(None),
+                next_pairing_id: AtomicU64::new(0),
+                pairing_lock: tokio::sync::Mutex::new(()),
                 address_type: RwLock::new(None),
                 local_name: RwLock::new(None),
                 advertisement_name: RwLock::new(None),
@@ -329,6 +344,113 @@ impl Peripheral {
             trace!("Could not emit an event. AdapterManager has been dropped");
         }
     }
+
+    /// Pairs if necessary, serializing concurrent callers so that if several read/write/
+    /// subscribe calls all hit `PermissionDenied` around the same time, only one of them
+    /// actually drives a pairing ceremony; the rest just wait on this lock and then find
+    /// `pair()` is a no-op once it's their turn.
+    async fn ensure_paired(&self) -> Result<()> {
+        let _guard = self.shared.pairing_lock.lock().await;
+        self.pair().await
+    }
+
+    fn clear_pending_pairing(&self) {
+        if let Ok(mut guard) = self.shared.pending_pairing.lock() {
+            *guard = None;
+        }
+    }
+
+    async fn write_inner(
+        &self,
+        characteristic: &Characteristic,
+        data: &[u8],
+        write_type: WriteType,
+    ) -> Result<()> {
+        let ble_service = &*self
+            .shared
+            .ble_services
+            .get(&characteristic.service_uuid)
+            .ok_or_else(|| Error::NotSupported("Service not found for write".into()))?;
+        let ble_characteristic = ble_service
+            .characteristics
+            .get(&characteristic.uuid)
+            .ok_or_else(|| Error::NotSupported("Characteristic not found for write".into()))?;
+        ble_characteristic.write_value(data, write_type).await
+    }
+
+    async fn subscribe_inner(&self, characteristic: &Characteristic) -> Result<()> {
+        let ble_service = &mut *self
+            .shared
+            .ble_services
+            .get_mut(&characteristic.service_uuid)
+            .ok_or_else(|| Error::NotSupported("Service not found for subscribe".into()))?;
+        let ble_characteristic = ble_service
+            .characteristics
+            .get_mut(&characteristic.uuid)
+            .ok_or_else(|| Error::NotSupported("Characteristic not found for subscribe".into()))?;
+        let notifications_sender = self.shared.notifications_channel.clone();
+        let uuid = characteristic.uuid;
+        let service_uuid = characteristic.service_uuid;
+        ble_characteristic
+            .subscribe(Box::new(move |value| {
+                let notification = ValueNotification {
+                    uuid,
+                    service_uuid,
+                    value,
+                };
+                // Note: we ignore send errors here which may happen while there are no
+                // receivers...
+                let _ = notifications_sender.send(notification);
+            }))
+            .await
+    }
+
+    async fn read_inner(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {
+        let ble_service = &*self
+            .shared
+            .ble_services
+            .get(&characteristic.service_uuid)
+            .ok_or_else(|| Error::NotSupported("Service not found for read".into()))?;
+        let ble_characteristic = ble_service
+            .characteristics
+            .get(&characteristic.uuid)
+            .ok_or_else(|| Error::NotSupported("Characteristic not found for read".into()))?;
+        ble_characteristic.read_value().await
+    }
+
+    async fn write_descriptor_inner(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
+        let ble_service = &*self
+            .shared
+            .ble_services
+            .get(&descriptor.service_uuid)
+            .ok_or_else(|| Error::NotSupported("Service not found for write".into()))?;
+        let ble_characteristic = ble_service
+            .characteristics
+            .get(&descriptor.characteristic_uuid)
+            .ok_or_else(|| Error::NotSupported("Characteristic not found for write".into()))?;
+        let ble_descriptor = ble_characteristic
+            .descriptors
+            .get(&descriptor.uuid)
+            .ok_or_else(|| Error::NotSupported("Descriptor not found for write".into()))?;
+        ble_descriptor.write_value(data).await
+    }
+
+    async fn read_descriptor_inner(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
+        let ble_service = &*self
+            .shared
+            .ble_services
+            .get(&descriptor.service_uuid)
+            .ok_or_else(|| Error::NotSupported("Service not found for read".into()))?;
+        let ble_characteristic = ble_service
+            .characteristics
+            .get(&descriptor.characteristic_uuid)
+            .ok_or_else(|| Error::NotSupported("Characteristic not found for read".into()))?;
+        let ble_descriptor = ble_characteristic
+            .descriptors
+            .get(&descriptor.uuid)
+            .ok_or_else(|| Error::NotSupported("Descriptor not found for read".into()))?;
+        ble_descriptor.read_value().await
+    }
 }
 
 impl Display for Peripheral {
@@ -548,45 +670,25 @@ impl ApiPeripheral for Peripheral {
         data: &[u8],
         write_type: WriteType,
     ) -> Result<()> {
-        let ble_service = &*self
-            .shared
-            .ble_services
-            .get(&characteristic.service_uuid)
-            .ok_or_else(|| Error::NotSupported("Service not found for write".into()))?;
-        let ble_characteristic = ble_service
-            .characteristics
-            .get(&characteristic.uuid)
-            .ok_or_else(|| Error::NotSupported("Characteristic not found for write".into()))?;
-        ble_characteristic.write_value(data, write_type).await
+        match self.write_inner(characteristic, data, write_type).await {
+            Err(Error::PermissionDenied) => {
+                self.ensure_paired().await?;
+                self.write_inner(characteristic, data, write_type).await
+            }
+            other => other,
+        }
     }
 
     /// Enables either notify or indicate (depending on support) for the specified characteristic.
     /// This is a synchronous call.
     async fn subscribe(&self, characteristic: &Characteristic) -> Result<()> {
-        let ble_service = &mut *self
-            .shared
-            .ble_services
-            .get_mut(&characteristic.service_uuid)
-            .ok_or_else(|| Error::NotSupported("Service not found for subscribe".into()))?;
-        let ble_characteristic = ble_service
-            .characteristics
-            .get_mut(&characteristic.uuid)
-            .ok_or_else(|| Error::NotSupported("Characteristic not found for subscribe".into()))?;
-        let notifications_sender = self.shared.notifications_channel.clone();
-        let uuid = characteristic.uuid;
-        let service_uuid = characteristic.service_uuid;
-        ble_characteristic
-            .subscribe(Box::new(move |value| {
-                let notification = ValueNotification {
-                    uuid,
-                    service_uuid,
-                    value,
-                };
-                // Note: we ignore send errors here which may happen while there are no
-                // receivers...
-                let _ = notifications_sender.send(notification);
-            }))
-            .await
+        match self.subscribe_inner(characteristic).await {
+            Err(Error::PermissionDenied) => {
+                self.ensure_paired().await?;
+                self.subscribe_inner(characteristic).await
+            }
+            other => other,
+        }
     }
 
     /// Disables either notify or indicate (depending on support) for the specified characteristic.
@@ -607,55 +709,38 @@ impl ApiPeripheral for Peripheral {
     }
 
     async fn read(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {
-        let ble_service = &*self
-            .shared
-            .ble_services
-            .get(&characteristic.service_uuid)
-            .ok_or_else(|| Error::NotSupported("Service not found for read".into()))?;
-        let ble_characteristic = ble_service
-            .characteristics
-            .get(&characteristic.uuid)
-            .ok_or_else(|| Error::NotSupported("Characteristic not found for read".into()))?;
-        ble_characteristic.read_value().await
+        match self.read_inner(characteristic).await {
+            Err(Error::PermissionDenied) => {
+                self.ensure_paired().await?;
+                self.read_inner(characteristic).await
+            }
+            other => other,
+        }
     }
 
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
         let receiver = self.shared.notifications_channel.subscribe();
-        Ok(notifications_stream_from_broadcast_receiver(receiver))
+        Ok(stream_from_broadcast_receiver(receiver))
     }
 
     async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
-        let ble_service = &*self
-            .shared
-            .ble_services
-            .get(&descriptor.service_uuid)
-            .ok_or_else(|| Error::NotSupported("Service not found for write".into()))?;
-        let ble_characteristic = ble_service
-            .characteristics
-            .get(&descriptor.characteristic_uuid)
-            .ok_or_else(|| Error::NotSupported("Characteristic not found for write".into()))?;
-        let ble_descriptor = ble_characteristic
-            .descriptors
-            .get(&descriptor.uuid)
-            .ok_or_else(|| Error::NotSupported("Descriptor not found for write".into()))?;
-        ble_descriptor.write_value(data).await
+        match self.write_descriptor_inner(descriptor, data).await {
+            Err(Error::PermissionDenied) => {
+                self.ensure_paired().await?;
+                self.write_descriptor_inner(descriptor, data).await
+            }
+            other => other,
+        }
     }
 
     async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
-        let ble_service = &*self
-            .shared
-            .ble_services
-            .get(&descriptor.service_uuid)
-            .ok_or_else(|| Error::NotSupported("Service not found for read".into()))?;
-        let ble_characteristic = ble_service
-            .characteristics
-            .get(&descriptor.characteristic_uuid)
-            .ok_or_else(|| Error::NotSupported("Characteristic not found for read".into()))?;
-        let ble_descriptor = ble_characteristic
-            .descriptors
-            .get(&descriptor.uuid)
-            .ok_or_else(|| Error::NotSupported("Descriptor not found for write".into()))?;
-        ble_descriptor.read_value().await
+        match self.read_descriptor_inner(descriptor).await {
+            Err(Error::PermissionDenied) => {
+                self.ensure_paired().await?;
+                self.read_descriptor_inner(descriptor).await
+            }
+            other => other,
+        }
     }
 
     async fn read_rssi(&self) -> Result<i16> {
@@ -680,6 +765,84 @@ impl ApiPeripheral for Peripheral {
             Some(device) => device.request_connection_parameters(preset),
             None => Err(Error::NotConnected),
         }
+    }
+
+    async fn pairing_requests(&self) -> Result<Pin<Box<dyn Stream<Item = PairingRequest> + Send>>> {
+        let receiver = self.shared.pairing_channel.subscribe();
+        Ok(stream_from_broadcast_receiver(receiver))
+    }
+
+    async fn respond_to_pairing_request(
+        &self,
+        id: PairingRequestId,
+        response: PairingResponse,
+    ) -> Result<()> {
+        let winrt_error = |e| Error::Other(format!("{:?}", e).into());
+
+        let (args, deferral) = {
+            let guard = self
+                .shared
+                .pending_pairing
+                .lock()
+                .map_err(|_| Error::Other("Pairing state lock poisoned".into()))?;
+            let (stored_id, args, deferral) = guard
+                .as_ref()
+                .ok_or_else(|| Error::Other("No pending pairing request".into()))?;
+
+            if *stored_id != id {
+                return Err(Error::Other(
+                    "Pairing request id does not match the currently pending request".into(),
+                ));
+            }
+
+            (args.clone(), deferral.clone())
+        };
+
+        match response {
+            PairingResponse::Accept => args.Accept().map_err(winrt_error)?,
+            PairingResponse::Pin(pin) => args
+                .AcceptWithPin(&HSTRING::from(pin))
+                .map_err(winrt_error)?,
+            // Leave the request un-accepted; completing the deferral without calling
+            // Accept/AcceptWithPin causes Windows to treat this as a rejection.
+            PairingResponse::Reject => {}
+        }
+        deferral.Complete().map_err(winrt_error)?;
+
+        let mut guard = self
+            .shared
+            .pending_pairing
+            .lock()
+            .map_err(|_| Error::Other("Pairing state lock poisoned".into()))?;
+        if guard
+            .as_ref()
+            .is_some_and(|(stored_id, _, _)| *stored_id == id)
+        {
+            *guard = None;
+        }
+        Ok(())
+    }
+
+    async fn pair(&self) -> Result<()> {
+        let device_guard = self.shared.device.lock().await;
+        let device = device_guard.as_ref().ok_or(Error::NotConnected)?;
+
+        let shared = self.shared.clone();
+        let handler: super::ble::device::PairingRequestedHandler =
+            Box::new(move |kind, args, deferral| {
+                let id = PairingRequestId(shared.next_pairing_id.fetch_add(1, Ordering::SeqCst));
+                if let Ok(mut guard) = shared.pending_pairing.lock() {
+                    *guard = Some((id, args, deferral));
+                }
+                // Ignore send errors, which just mean nobody's listening on pairing_requests()
+                // right now; the deferral is still safely stashed for whenever someone calls
+                // respond_to_pairing_request with the right id.
+                let _ = shared.pairing_channel.send(PairingRequest { id, kind });
+            });
+
+        let result = device.start_pairing(handler).await;
+        self.clear_pending_pairing();
+        result
     }
 }
 
