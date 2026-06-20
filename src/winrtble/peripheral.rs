@@ -45,10 +45,12 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use std::sync::Weak;
-use windows::Devices::Bluetooth::{Advertisement::*, BluetoothAddressType, GenericAttributeProfile::GattCharacteristic};
-use windows::Storage::Streams::DataReader;
+use windows::Devices::Bluetooth::{
+    Advertisement::*, BluetoothAddressType, GenericAttributeProfile::GattCharacteristic,
+};
 use windows::Devices::Enumeration::DevicePairingRequestedEventArgs;
 use windows::Foundation::Deferral;
+use windows::Storage::Streams::DataReader;
 use windows::core::{GUID, HSTRING};
 
 #[cfg_attr(
@@ -807,7 +809,18 @@ impl ApiPeripheral for Peripheral {
             // Accept/AcceptWithPin causes Windows to treat this as a rejection.
             PairingResponse::Reject => {}
         }
-        deferral.Complete().map_err(winrt_error)?;
+
+        // Complete the deferral on a best-effort basis: log failures rather than propagating
+        // them with `?`. If `Complete()` fails, Windows has very likely already resolved the
+        // ceremony on its own (timeout, disconnect, OS-level cancellation), so there's nothing
+        // left for the caller to retry - but `pending_pairing` still needs to be cleared below
+        // either way, or this slot stays stuck holding a dead handle forever.
+        if let Err(err) = deferral.Complete() {
+            warn!(
+                "respond_to_pairing_request: deferral.Complete failed: {:?}",
+                err
+            );
+        }
 
         let mut guard = self
             .shared

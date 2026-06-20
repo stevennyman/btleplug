@@ -15,7 +15,7 @@ use super::{super::utils::to_descriptor_value, descriptor::BLEDescriptor};
 use crate::{
     Error, Result,
     api::{Characteristic, WriteType},
-    winrtble::utils,
+    winrtble::{errors, utils},
 };
 
 use log::{debug, trace};
@@ -69,9 +69,9 @@ impl BLECharacteristic {
         writer.WriteBytes(data)?;
         let operation = self
             .characteristic
-            .WriteValueWithOptionAsync(&writer.DetachBuffer()?, write_type.into())?;
+            .WriteValueWithResultAndOptionAsync(&writer.DetachBuffer()?, write_type.into())?;
         let result = operation.into_future().await?;
-        utils::to_error(result)
+        errors::check_gatt("write", &result)
     }
 
     pub async fn read_value(&self) -> Result<Vec<u8>> {
@@ -80,7 +80,7 @@ impl BLECharacteristic {
             .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)?
             .into_future()
             .await?;
-        utils::to_error(result.Status()?)?;
+        errors::check_gatt("read", &result)?;
 
         let value = result.Value()?;
         let reader = DataReader::FromBuffer(&value)?;
@@ -120,13 +120,13 @@ impl BLECharacteristic {
         };
         self.notify_token = Some(token);
 
-        let status = self
+        let result = self
             .characteristic
-            .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
+            .WriteClientCharacteristicConfigurationDescriptorWithResultAsync(config)?
             .into_future()
             .await?;
-        trace!("subscribe {:?}", status);
-        if let Err(err) = utils::to_error(status) {
+        trace!("subscribe {:?}", result.Status()?);
+        if let Err(err) = errors::check_gatt("subscribe", &result) {
             if let Some(token) = &self.notify_token {
                 let _ = self.characteristic.RemoveValueChanged(*token);
                 self.notify_token = None;
@@ -143,13 +143,13 @@ impl BLECharacteristic {
         }
         self.notify_token = None;
         let config = GattClientCharacteristicConfigurationDescriptorValue::None;
-        let status = self
+        let result = self
             .characteristic
-            .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
+            .WriteClientCharacteristicConfigurationDescriptorWithResultAsync(config)?
             .into_future()
             .await?;
-        trace!("unsubscribe {:?}", status);
-        utils::to_error(status)
+        trace!("unsubscribe {:?}", result.Status()?);
+        errors::check_gatt("unsubscribe", &result)
     }
 
     pub fn uuid(&self) -> Uuid {

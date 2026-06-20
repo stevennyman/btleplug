@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::{
     Error, Result,
     api::{BDAddr, PairingRequestKind},
-    winrtble::utils,
+    winrtble::errors,
 };
 use log::{debug, trace, warn};
 use tokio::time::timeout;
@@ -134,7 +134,7 @@ impl BLEDevice {
 
         let service_result = self.get_gatt_services(BluetoothCacheMode::Uncached).await?;
         let status = service_result.Status().map_err(|_| Error::DeviceNotFound)?;
-        utils::to_error(status)
+        errors::check_gatt("connect", &status)
     }
 
     async fn is_connected(&self) -> Result<bool> {
@@ -324,8 +324,20 @@ impl BLEDevice {
             | DevicePairingKinds::ProvidePin
             | DevicePairingKinds::ConfirmPinMatch;
 
+        // `Default` lets Windows skip MITM-protected pairing if it judges the device doesn't
+        // need it. Some peripherals advertise GATT attributes that require authentication or
+        // encryption (surfaced as `GattProtocolError::InsufficientAuthentication`/
+        // `InsufficientEncryption` on read/write) but don't strictly require it during the
+        // pairing ceremony itself, so a `Default`-level pairing can complete successfully while
+        // leaving those attributes still inaccessible - the retried operation in
+        // `Peripheral::ensure_paired` then fails with the exact same error, in a loop.
+        // Requesting `EncryptionAndAuthentication` makes Windows negotiate the strongest method
+        // the device supports up front, which is what actually unlocks those attributes.
         let pair_result = custom_pairing
-            .PairWithProtectionLevelAsync(kinds, DevicePairingProtectionLevel::Default)
+            .PairWithProtectionLevelAsync(
+                kinds,
+                DevicePairingProtectionLevel::EncryptionAndAuthentication,
+            )
             .map_err(winrt_error)?
             .await
             .map_err(winrt_error);
@@ -337,7 +349,7 @@ impl BLEDevice {
         }
 
         let status = pair_result?.Status().map_err(winrt_error)?;
-        utils::pairing_status_to_error(status)
+        errors::pairing_status_to_error(status)
     }
 }
 

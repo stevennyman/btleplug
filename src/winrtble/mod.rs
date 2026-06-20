@@ -13,6 +13,7 @@
 
 pub mod adapter;
 mod ble;
+mod errors;
 pub mod manager;
 pub mod peripheral;
 mod utils;

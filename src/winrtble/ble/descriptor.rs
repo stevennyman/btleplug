@@ -11,7 +11,7 @@
 //
 // Copyright (c) 2014 The Rust Project Developers
 
-use super::super::utils;
+use super::super::{errors, utils};
 use crate::{Result, api::Descriptor};
 use std::future::IntoFuture;
 use uuid::Uuid;
@@ -46,9 +46,11 @@ impl BLEDescriptor {
     pub async fn write_value(&self, data: &[u8]) -> Result<()> {
         let writer = DataWriter::new()?;
         writer.WriteBytes(data)?;
-        let operation = self.descriptor.WriteValueAsync(&writer.DetachBuffer()?)?;
+        let operation = self
+            .descriptor
+            .WriteValueWithResultAsync(&writer.DetachBuffer()?)?;
         let result = operation.into_future().await?;
-        utils::to_error(result)
+        errors::check_gatt("write descriptor", &result)
     }
 
     pub async fn read_value(&self) -> Result<Vec<u8>> {
@@ -57,7 +59,7 @@ impl BLEDescriptor {
             .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)?
             .into_future()
             .await?;
-        utils::to_error(result.Status()?)?;
+        errors::check_gatt("read descriptor", &result)?;
 
         let value = result.Value()?;
         let reader = DataReader::FromBuffer(&value)?;

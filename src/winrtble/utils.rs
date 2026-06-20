@@ -11,49 +11,20 @@
 //
 // Copyright (c) 2014 The Rust Project Developers
 
-use crate::{Error, Result, api::CharPropFlags};
+use crate::api::CharPropFlags;
 use std::str::FromStr;
 use uuid::Uuid;
 use windows::core::GUID;
 use windows::{
     Devices::Bluetooth::GenericAttributeProfile::{
         GattCharacteristicProperties, GattClientCharacteristicConfigurationDescriptorValue,
-        GattCommunicationStatus,
     },
-    Devices::Enumeration::DevicePairingResultStatus,
     Storage::Streams::{DataReader, IBuffer},
 };
 
-pub fn to_error(status: GattCommunicationStatus) -> Result<()> {
-    if status == GattCommunicationStatus::AccessDenied {
-        Err(Error::PermissionDenied)
-    } else if status == GattCommunicationStatus::Unreachable {
-        Err(Error::NotConnected)
-    } else if status == GattCommunicationStatus::Success {
-        Ok(())
-    } else if status == GattCommunicationStatus::ProtocolError {
-        Err(Error::NotSupported("ProtocolError".to_string()))
-    } else {
-        Err(Error::Other("Communication Error:".to_string().into()))
-    }
-}
-
-/// Maps a Windows pairing result status to a btleplug [`Error`]. `Paired` and `AlreadyPaired`
-/// are treated as success; everything else (rejection, timeout, hardware failure, etc.) is
-/// folded into [`Error::Other`] with the status preserved in the message for debugging, since
-/// the long tail of `DevicePairingResultStatus` variants doesn't map cleanly onto btleplug's
-/// existing error categories.
-pub fn pairing_status_to_error(status: DevicePairingResultStatus) -> Result<()> {
-    if status == DevicePairingResultStatus::Paired
-        || status == DevicePairingResultStatus::AlreadyPaired
-    {
-        Ok(())
-    } else {
-        Err(Error::Other(
-            format!("Pairing failed with status {:?}", status).into(),
-        ))
-    }
-}
+// `to_error`/`pairing_status_to_error` have moved to `winrtble::errors`, which also handles
+// the `GattProtocolError` (auth/encryption) cases that a bare `GattCommunicationStatus` can't
+// distinguish.
 
 pub fn to_descriptor_value(
     properties: GattCharacteristicProperties,
@@ -120,9 +91,7 @@ pub fn to_char_props(props: &GattCharacteristicProperties) -> CharPropFlags {
     {
         flags |= CharPropFlags::EXTENDED_PROPERTIES;
     }
-    if *props & GattCharacteristicProperties::ReliableWrites
-        != GattCharacteristicProperties::None
-    {
+    if *props & GattCharacteristicProperties::ReliableWrites != GattCharacteristicProperties::None {
         flags |= CharPropFlags::RELIABLE_WRITE;
     }
     if *props & GattCharacteristicProperties::WritableAuxiliaries
