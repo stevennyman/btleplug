@@ -28,7 +28,7 @@ use crate::{
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::stream::Stream;
-use log::{trace, warn};
+use log::{debug, trace, warn};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
@@ -353,7 +353,26 @@ impl Peripheral {
     /// `pair()` is a no-op once it's their turn.
     async fn ensure_paired(&self) -> Result<()> {
         let _guard = self.shared.pairing_lock.lock().await;
-        self.pair().await
+        debug!("ensure_paired: starting pair()");
+        let result = self.pair().await;
+        debug!("ensure_paired: pair() returned {:?}", result);
+        result
+    }
+
+    /// Builds the `PairingRequestedHandler` that funnels WinRT pairing-ceremony events into
+    /// `pairing_requests()`/`respond_to_pairing_request()`.
+    fn build_pairing_handler(&self) -> super::ble::device::PairingRequestedHandler {
+        let shared = self.shared.clone();
+        Box::new(move |kind, args, deferral| {
+            let id = PairingRequestId(shared.next_pairing_id.fetch_add(1, Ordering::SeqCst));
+            if let Ok(mut guard) = shared.pending_pairing.lock() {
+                *guard = Some((id, args, deferral));
+            }
+            // Ignore send errors, which just mean nobody's listening on pairing_requests()
+            // right now; the deferral is still safely stashed for whenever someone calls
+            // respond_to_pairing_request with the right id.
+            let _ = shared.pairing_channel.send(PairingRequest { id, kind });
+        })
     }
 
     fn clear_pending_pairing(&self) {
@@ -713,10 +732,19 @@ impl ApiPeripheral for Peripheral {
     async fn read(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {
         match self.read_inner(characteristic).await {
             Err(Error::PermissionDenied) => {
+                debug!("read: got PermissionDenied, calling ensure_paired then retrying");
                 self.ensure_paired().await?;
                 self.read_inner(characteristic).await
             }
-            other => other,
+            other => {
+                if let Err(ref e) = other {
+                    debug!(
+                        "read: read_inner failed with non-PermissionDenied error: {:?}",
+                        e
+                    );
+                }
+                other
+            }
         }
     }
 
@@ -836,23 +864,13 @@ impl ApiPeripheral for Peripheral {
         Ok(())
     }
 
+    /// Builds the `PairingRequestedHandler` that funnels WinRT pairing-ceremony events into
+    /// `pairing_requests()`/`respond_to_pairing_request()`.
     async fn pair(&self) -> Result<()> {
         let device_guard = self.shared.device.lock().await;
         let device = device_guard.as_ref().ok_or(Error::NotConnected)?;
 
-        let shared = self.shared.clone();
-        let handler: super::ble::device::PairingRequestedHandler =
-            Box::new(move |kind, args, deferral| {
-                let id = PairingRequestId(shared.next_pairing_id.fetch_add(1, Ordering::SeqCst));
-                if let Ok(mut guard) = shared.pending_pairing.lock() {
-                    *guard = Some((id, args, deferral));
-                }
-                // Ignore send errors, which just mean nobody's listening on pairing_requests()
-                // right now; the deferral is still safely stashed for whenever someone calls
-                // respond_to_pairing_request with the right id.
-                let _ = shared.pairing_channel.send(PairingRequest { id, kind });
-            });
-
+        let handler = self.build_pairing_handler();
         let result = device.start_pairing(handler).await;
         self.clear_pending_pairing();
         result

@@ -30,8 +30,7 @@ use windows::{
         },
     },
     Devices::Enumeration::{
-        DeviceInformationCustomPairing, DevicePairingKinds, DevicePairingProtectionLevel,
-        DevicePairingRequestedEventArgs,
+        DeviceInformationCustomPairing, DevicePairingKinds, DevicePairingRequestedEventArgs,
     },
     Foundation::{Deferral, TypedEventHandler},
 };
@@ -306,49 +305,61 @@ impl BLEDevice {
         let device_information = self.device.DeviceInformation().map_err(winrt_error)?;
         let pairing = device_information.Pairing().map_err(winrt_error)?;
 
-        if pairing.IsPaired().unwrap_or(false) {
+        let is_paired = pairing.IsPaired().unwrap_or(false);
+        let can_pair = pairing.CanPair().unwrap_or(true);
+        debug!("start_pairing: IsPaired={} CanPair={}", is_paired, can_pair);
+
+        if is_paired {
             debug!("start_pairing: already paired, nothing to do");
             return Ok(());
         }
 
+        if !can_pair {
+            return Err(Error::NotSupported(
+                "Device cannot be paired from this connection; pair it via Windows Settings \
+                 (Settings > Bluetooth & devices) first, then retry"
+                    .to_string(),
+            ));
+        }
+
         let custom_pairing = pairing.Custom().map_err(winrt_error)?;
+
+        debug!("start_pairing: obtained custom pairing object");
+
         let pairing_requested_token =
             register_pairing_requested_handler(&custom_pairing, on_pairing_requested)
                 .map_err(winrt_error)?;
 
-        // Only request the ceremony kinds we actually know how to drive a response for.
-        // ProvidePasswordCredential is intentionally excluded - it's effectively unused for BLE
-        // peripherals and we don't have a response path for it.
-        let kinds = DevicePairingKinds::ConfirmOnly
-            | DevicePairingKinds::DisplayPin
-            | DevicePairingKinds::ProvidePin
-            | DevicePairingKinds::ConfirmPinMatch;
+        debug!("start_pairing: registered PairingRequested handler");
 
-        // `Default` lets Windows skip MITM-protected pairing if it judges the device doesn't
-        // need it. Some peripherals advertise GATT attributes that require authentication or
-        // encryption (surfaced as `GattProtocolError::InsufficientAuthentication`/
-        // `InsufficientEncryption` on read/write) but don't strictly require it during the
-        // pairing ceremony itself, so a `Default`-level pairing can complete successfully while
-        // leaving those attributes still inaccessible - the retried operation in
-        // `Peripheral::ensure_paired` then fails with the exact same error, in a loop.
-        // Requesting `EncryptionAndAuthentication` makes Windows negotiate the strongest method
-        // the device supports up front, which is what actually unlocks those attributes.
+        let kinds = DevicePairingKinds::ConfirmOnly
+            | DevicePairingKinds::ProvidePin
+            | DevicePairingKinds::DisplayPin
+            | DevicePairingKinds::ConfirmPinMatch
+            | DevicePairingKinds::ProvidePasswordCredential;
+
+        debug!("start_pairing: calling PairAsync(kinds={:?})", kinds);
+
         let pair_result = custom_pairing
-            .PairWithProtectionLevelAsync(
-                kinds,
-                DevicePairingProtectionLevel::EncryptionAndAuthentication,
-            )
+            .PairAsync(kinds)
             .map_err(winrt_error)?
             .await
-            .map_err(winrt_error);
+            .map_err(winrt_error)?;
 
-        // Best-effort cleanup. A failure here shouldn't mask the actual pairing result, and
-        // there's nothing useful we can do about it beyond logging.
+        let status = pair_result.Status().map_err(winrt_error)?;
+
+        debug!("start_pairing: PairAsync returned {:?}", status);
+
+        debug!(
+            "start_pairing: after pair IsPaired={} CanPair={}",
+            pairing.IsPaired().unwrap_or(false),
+            pairing.CanPair().unwrap_or(false),
+        );
+
         if let Err(err) = custom_pairing.RemovePairingRequested(pairing_requested_token) {
-            debug!("start_pairing: remove_pairing_requested {:?}", err);
+            debug!("start_pairing: RemovePairingRequested failed: {:?}", err);
         }
 
-        let status = pair_result?.Status().map_err(winrt_error)?;
         errors::pairing_status_to_error(status)
     }
 }
@@ -375,6 +386,16 @@ fn register_pairing_requested_handler(
                 // a plain yes/no confirmation.
                 _ => PairingRequestKind::ConfirmOnly,
             };
+
+            debug!("PairingRequested fired");
+
+            debug!("PairingRequested kind: {:?}", args.PairingKind()?);
+
+            let pin = args.Pin()?;
+            if !pin.is_empty() {
+                debug!("PairingRequested pin: {}", pin);
+            }
+
             on_pairing_requested(kind, args.clone(), deferral);
         }
         Ok(())
