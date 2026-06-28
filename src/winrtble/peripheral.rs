@@ -383,12 +383,24 @@ impl Peripheral {
     /// id to correlate the ceremony's outcome with the request(s) that preceded it on the
     /// `pairing_requests()` stream - it's not available any other way once cleared, since the
     /// live WinRT handles being dropped here are the only thing that knows it.
+    ///
+    /// If a deferral is still stashed (the ceremony ended without `respond_to_pairing_request`
+    /// ever being called for it - e.g. WinRT's own authentication timeout fired before the
+    /// extension answered), it's explicitly completed here rather than silently dropped.
+    /// Dropping an incomplete `Deferral` leaves WinRT's side of the ceremony in an undefined
+    /// state.
     fn clear_pending_pairing(&self) -> Option<PairingRequestId> {
-        if let Ok(mut guard) = self.shared.pending_pairing.lock() {
-            guard.take().map(|(id, _, _)| id)
+        let pending = if let Ok(mut guard) = self.shared.pending_pairing.lock() {
+            guard.take()
         } else {
             None
-        }
+        };
+        pending.map(|(id, _args, deferral)| {
+            if let Err(err) = deferral.Complete() {
+                debug!("clear_pending_pairing: deferral.Complete failed: {:?}", err);
+            }
+            id
+        })
     }
 
     async fn write_inner(
