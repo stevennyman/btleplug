@@ -31,6 +31,7 @@ use windows::{
     },
     Devices::Enumeration::{
         DeviceInformationCustomPairing, DevicePairingKinds, DevicePairingRequestedEventArgs,
+        DevicePairingResultStatus,
     },
     Foundation::{Deferral, TypedEventHandler},
 };
@@ -299,7 +300,18 @@ impl BLEDevice {
     /// to confirm a PIN or otherwise acknowledge the pairing request. This call doesn't return
     /// until the ceremony completes one way or another - successfully, rejected, or timed out -
     /// since the corresponding `PairAsync` WinRT call doesn't resolve until then.
-    pub async fn start_pairing(&self, on_pairing_requested: PairingRequestedHandler) -> Result<()> {
+    ///
+    /// Returns the raw [`DevicePairingResultStatus`] from WinRT rather than folding it into an
+    /// `Err` itself; the caller (`Peripheral::pair` in `winrtble/peripheral.rs`) is responsible
+    /// for both mapping it to a [`crate::Error`] via [`errors::pairing_status_to_error`] *and*
+    /// reporting it on the `pairing_requests()` stream, correlated to the request id that's only
+    /// known to the caller (it's tracked alongside the live WinRT pairing handles, not visible
+    /// from here). An `Err` from this function means we never got as far as a WinRT pairing
+    /// result at all (e.g. not connected, or pairing unsupported for this device).
+    pub async fn start_pairing(
+        &self,
+        on_pairing_requested: PairingRequestedHandler,
+    ) -> Result<DevicePairingResultStatus> {
         let winrt_error = |e| Error::Other(format!("{:?}", e).into());
 
         let device_information = self.device.DeviceInformation().map_err(winrt_error)?;
@@ -311,7 +323,7 @@ impl BLEDevice {
 
         if is_paired {
             debug!("start_pairing: already paired, nothing to do");
-            return Ok(());
+            return Ok(DevicePairingResultStatus::AlreadyPaired);
         }
 
         if !can_pair {
@@ -335,8 +347,7 @@ impl BLEDevice {
         let kinds = DevicePairingKinds::ConfirmOnly
             | DevicePairingKinds::ProvidePin
             | DevicePairingKinds::DisplayPin
-            | DevicePairingKinds::ConfirmPinMatch
-            | DevicePairingKinds::ProvidePasswordCredential;
+            | DevicePairingKinds::ConfirmPinMatch;
 
         debug!("start_pairing: calling PairAsync(kinds={:?})", kinds);
 
@@ -360,7 +371,7 @@ impl BLEDevice {
             debug!("start_pairing: RemovePairingRequested failed: {:?}", err);
         }
 
-        errors::pairing_status_to_error(status)
+        Ok(status)
     }
 }
 

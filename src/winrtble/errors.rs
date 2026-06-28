@@ -168,3 +168,22 @@ pub(crate) fn pairing_status_to_error(status: DevicePairingResultStatus) -> Resu
         ))
     }
 }
+
+/// Maps a Windows pairing result status to a [`crate::api::PairingOutcome`] for reporting on
+/// the `pairing_requests()` stream. This is the [`PairingOutcome`](crate::api::PairingOutcome)
+/// counterpart to [`pairing_status_to_error`] - same input, but producing a value to broadcast
+/// to pairing_requests() listeners rather than an `Err` to return from `pair()`.
+pub(crate) fn pairing_status_to_outcome(
+    status: DevicePairingResultStatus,
+) -> crate::api::PairingOutcome {
+    use crate::api::PairingOutcome;
+    match status {
+        DevicePairingResultStatus::Paired | DevicePairingResultStatus::AlreadyPaired => {
+            PairingOutcome::Paired
+        }
+        DevicePairingResultStatus::AuthenticationTimeout => PairingOutcome::AuthenticationTimeout,
+        DevicePairingResultStatus::PairingCanceled => PairingOutcome::Canceled,
+        DevicePairingResultStatus::RejectedByHandler => PairingOutcome::Rejected,
+        other => PairingOutcome::Failed(format!("{:?}", other)),
+    }
+}

@@ -19,11 +19,13 @@ use crate::{
     Error, Result,
     api::{
         self, AddressType, BDAddr, CentralEvent, Characteristic, ConnectionParameterPreset,
-        ConnectionParameters, Descriptor, PairingRequest, PairingRequestId, PairingResponse,
-        Peripheral as ApiPeripheral, PeripheralProperties, Service, ValueNotification, WriteType,
+        ConnectionParameters, Descriptor, PairingEvent, PairingRequest, PairingRequestId,
+        PairingResponse, Peripheral as ApiPeripheral, PeripheralProperties, Service,
+        ValueNotification, WriteType,
         bleuuid::{uuid_from_u16, uuid_from_u32},
     },
     common::{adapter_manager::AdapterManager, util::stream_from_broadcast_receiver},
+    winrtble::errors,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -81,7 +83,7 @@ struct Shared {
     connected: AtomicBool,
     ble_services: DashMap<Uuid, BLEService>,
     notifications_channel: broadcast::Sender<ValueNotification>,
-    pairing_channel: broadcast::Sender<PairingRequest>,
+    pairing_channel: broadcast::Sender<PairingEvent>,
     // Holds the live WinRT handles for whichever pairing request is currently awaiting a
     // response from the application. `Accept`/`AcceptWithPin` must be called on this exact
     // `DevicePairingRequestedEventArgs` before completing its `Deferral` - they can't be
@@ -371,13 +373,21 @@ impl Peripheral {
             // Ignore send errors, which just mean nobody's listening on pairing_requests()
             // right now; the deferral is still safely stashed for whenever someone calls
             // respond_to_pairing_request with the right id.
-            let _ = shared.pairing_channel.send(PairingRequest { id, kind });
+            let _ = shared
+                .pairing_channel
+                .send(PairingEvent::Request(PairingRequest { id, kind }));
         })
     }
 
-    fn clear_pending_pairing(&self) {
+    /// Clears the pending-pairing slot and returns the id it held, if any. `pair()` needs this
+    /// id to correlate the ceremony's outcome with the request(s) that preceded it on the
+    /// `pairing_requests()` stream - it's not available any other way once cleared, since the
+    /// live WinRT handles being dropped here are the only thing that knows it.
+    fn clear_pending_pairing(&self) -> Option<PairingRequestId> {
         if let Ok(mut guard) = self.shared.pending_pairing.lock() {
-            *guard = None;
+            guard.take().map(|(id, _, _)| id)
+        } else {
+            None
         }
     }
 
@@ -797,7 +807,7 @@ impl ApiPeripheral for Peripheral {
         }
     }
 
-    async fn pairing_requests(&self) -> Result<Pin<Box<dyn Stream<Item = PairingRequest> + Send>>> {
+    async fn pairing_requests(&self) -> Result<Pin<Box<dyn Stream<Item = PairingEvent> + Send>>> {
         let receiver = self.shared.pairing_channel.subscribe();
         Ok(stream_from_broadcast_receiver(receiver))
     }
@@ -871,9 +881,28 @@ impl ApiPeripheral for Peripheral {
         let device = device_guard.as_ref().ok_or(Error::NotConnected)?;
 
         let handler = self.build_pairing_handler();
-        let result = device.start_pairing(handler).await;
-        self.clear_pending_pairing();
-        result
+        let pair_result = device.start_pairing(handler).await;
+        let cleared_id = self.clear_pending_pairing();
+
+        match pair_result {
+            Ok(status) => {
+                // Report the outcome on pairing_requests() before translating it into this
+                // function's Result<()>, so listeners learn the ceremony ended even when the
+                // caller of `pair()` itself doesn't propagate the error onward.
+                if let Some(id) = cleared_id {
+                    let _ = self.shared.pairing_channel.send(PairingEvent::Outcome {
+                        id,
+                        status: errors::pairing_status_to_outcome(status),
+                    });
+                }
+                errors::pairing_status_to_error(status)
+            }
+            // We never got as far as a WinRT pairing result (not connected, pairing not
+            // supported for this device, etc.) - there's no DevicePairingResultStatus to
+            // report, and nothing was ever added to pairing_requests() for this attempt, so
+            // there's no PairingEvent::Outcome to send either.
+            Err(err) => Err(err),
+        }
     }
 }
 

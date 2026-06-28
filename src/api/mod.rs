@@ -150,6 +150,64 @@ pub struct PairingRequest {
     pub kind: PairingRequestKind,
 }
 
+/// How a pairing ceremony ultimately concluded, reported via [`PairingEvent::Outcome`] once the
+/// underlying OS pairing call returns. This is the terminal counterpart to [`PairingRequest`]:
+/// a request may be followed by zero, one, or several more requests (multi-step ceremonies), but
+/// is always followed by exactly one outcome for a given [`PairingRequestId`], whether or not
+/// [`Peripheral::respond_to_pairing_request`] was ever called for it (e.g. the OS can time out or
+/// cancel a ceremony on its own).
+///
+/// This is currently only emitted on Windows, mirroring [`PairingRequestKind`].
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PairingOutcome {
+    /// Pairing completed successfully (including the case where the device was already
+    /// paired and no ceremony was needed).
+    Paired,
+    /// The user or remote device didn't respond to the pairing request in time. This is the
+    /// terminal status to watch for if you need to know when a [`PairingRequest`] you're
+    /// holding onto (e.g. showing a dialog for) is no longer answerable - by the time this
+    /// arrives, the OS has already abandoned the ceremony and a subsequent
+    /// [`Peripheral::respond_to_pairing_request`] call for that id will fail.
+    AuthenticationTimeout,
+    /// The pairing request was explicitly rejected - either by the application (via
+    /// [`PairingResponse::Reject`]) or by the remote device.
+    Rejected,
+    /// The OS or application canceled the pairing ceremony before it completed.
+    Canceled,
+    /// Pairing failed for some other reason. The original WinRT
+    /// `DevicePairingResultStatus` is preserved via its `Debug` form for diagnostics, since
+    /// the long tail of statuses (`NotReadyToPair`, `ConnectionRejected`, `HardwareFailure`,
+    /// etc.) doesn't map cleanly onto a small enum.
+    Failed(String),
+}
+
+/// An event emitted on the [`Peripheral::pairing_requests`] stream: either a new step in an
+/// ongoing pairing ceremony ([`PairingEvent::Request`]), or the final result of a ceremony that
+/// has just concluded ([`PairingEvent::Outcome`]).
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PairingEvent {
+    /// The OS needs the application to confirm a PIN or otherwise acknowledge a pairing step.
+    Request(PairingRequest),
+    /// A pairing ceremony has concluded. `id` matches the [`PairingRequest::id`] of the request
+    /// (or most recent request, for multi-step ceremonies) that this outcome corresponds to.
+    Outcome {
+        /// Identifies which pairing ceremony this outcome belongs to.
+        id: PairingRequestId,
+        /// How the ceremony concluded.
+        status: PairingOutcome,
+    },
+}
+
 /// The application's response to a [`PairingRequest`].
 #[cfg_attr(
     feature = "serde",
@@ -466,7 +524,7 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     /// (ideally right after [`connect`](Peripheral::connect)) - a request that fires before
     /// anyone is listening will go unanswered and the underlying `pair`/retried operation will
     /// eventually time out.
-    async fn pairing_requests(&self) -> Result<Pin<Box<dyn Stream<Item = PairingRequest> + Send>>> {
+    async fn pairing_requests(&self) -> Result<Pin<Box<dyn Stream<Item = PairingEvent> + Send>>> {
         Err(crate::Error::NotSupported("pairing_requests".to_string()))
     }
 
