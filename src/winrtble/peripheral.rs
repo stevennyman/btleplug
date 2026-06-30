@@ -42,8 +42,10 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     sync::{Arc, Mutex, RwLock},
+    time::Duration,
 };
 use tokio::sync::broadcast;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 use std::sync::Weak;
@@ -534,6 +536,17 @@ impl Debug for Peripheral {
     }
 }
 
+// Windows BLE connection attempts can occasionally get stuck with the underlying WinRT
+// IAsyncOperation never resolving (this is a known real-world Windows Bluetooth stack
+// behavior, not specific to btleplug. Without a bound here, that hangs this call forever with
+// no error ever reaching the caller. On timeout we deliberately do NOT attempt any cleanup
+// (e.g. calling disconnect()) since the underlying operation may genuinely still be running;
+// interfering with it could disrupt a connection that would otherwise still succeed, or a
+// later reconnect attempt initiated by the caller. connection_status_changed will still
+// fire and update connected/emit the right CentralEvent if/when the operation does resolve
+// on its own, independent of this function having already given up and returned an error.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[async_trait]
 impl ApiPeripheral for Peripheral {
     fn id(&self) -> PeripheralId {
@@ -607,7 +620,18 @@ impl ApiPeripheral for Peripheral {
         )
         .await?;
 
-        device.connect().await?;
+        match timeout(CONNECT_TIMEOUT, device.connect()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(Error::Other(
+                    format!(
+                        "Timed out after {:?} waiting for the device to connect",
+                        CONNECT_TIMEOUT
+                    )
+                    .into(),
+                ));
+            }
+        }
         // Query the system-cached device name (GAP name) and update local_name
         if let Ok(name) = device.name() {
             let name_str = name.to_string();
