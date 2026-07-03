@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use bluez_async::{
-    BluetoothEvent, BluetoothSession, CharacteristicEvent, CharacteristicFlags, CharacteristicId,
-    CharacteristicInfo, DescriptorInfo, DeviceId, DeviceInfo, MacAddress, PreferredBearer,
-    ServiceInfo, WriteOptions,
+    BluetoothError, BluetoothEvent, BluetoothSession, CharacteristicEvent, CharacteristicFlags,
+    CharacteristicId, CharacteristicInfo, DescriptorInfo, DeviceId, DeviceInfo, MacAddress,
+    PreferredBearer, ServiceInfo, WriteOptions,
 };
 use futures::future::{join_all, ready};
 use futures::stream::{Stream, StreamExt};
+use log::debug;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
@@ -128,6 +129,21 @@ impl Peripheral {
     }
 }
 
+fn is_connection_unknown_error(error: &BluetoothError) -> bool {
+    let BluetoothError::DbusError(dbus_error) = error else {
+        return false;
+    };
+    dbus_error
+        .message()
+        .map(|message| {
+            let message = message.to_ascii_lowercase();
+            message.contains("br-connection-unknown")
+                || message.contains("le-connection-unknown")
+                || message.contains("connection-unknown")
+        })
+        .unwrap_or(false)
+}
+
 #[async_trait]
 impl api::Peripheral for Peripheral {
     fn id(&self) -> PeripheralId {
@@ -198,6 +214,50 @@ impl api::Peripheral for Peripheral {
         };
 
         if let Err(connect_error) = self.session.connect(&self.device).await {
+            // BlueZ can sometimes report "*-connection-unknown" while racing its own
+            // bearer-state bookkeeping; in that case, verify the actual connected
+            // state and retry once before surfacing an error.
+            if is_connection_unknown_error(&connect_error) {
+                if let Ok(device_info) = self.device_info().await {
+                    if device_info.connected {
+                        debug!(
+                            "BlueZ Connect returned {:?} for {:?}, but device is connected; treating as success",
+                            connect_error, self.device
+                        );
+                        return Ok(());
+                    }
+                }
+                debug!(
+                    "BlueZ Connect returned {:?} for {:?}; retrying once",
+                    connect_error, self.device
+                );
+                match self.session.connect(&self.device).await {
+                    Ok(()) => return Ok(()),
+                    Err(retry_error) => {
+                        if is_connection_unknown_error(&retry_error) {
+                            if let Ok(device_info) = self.device_info().await {
+                                if device_info.connected {
+                                    debug!(
+                                        "BlueZ Connect retry returned {:?} for {:?}, but device is connected; treating as success",
+                                        retry_error, self.device
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        if let Some(preferred_bearer_error) = preferred_bearer_error {
+                            return Err(Error::Other(
+                                format!(
+                                    "BlueZ Connect failed with transient bearer-state errors for {:?}: preferred_bearer_error={:?}; first_connect_error={:?}; retry_connect_error={:?}",
+                                    self.device, preferred_bearer_error, connect_error, retry_error
+                                )
+                                .into(),
+                            ));
+                        }
+                        return Err(retry_error.into());
+                    }
+                }
+            }
             if let Some(preferred_bearer_error) = preferred_bearer_error {
                 return Err(Error::Other(
                     format!(
