@@ -72,10 +72,18 @@ impl Central for Adapter {
     }
 
     async fn start_scan(&self, filter: ScanFilter) -> Result<()> {
+        // Transport::Auto interleaves BR/EDR inquiry alongside LE scanning (BlueZ's own
+        // default). This project only ever cares about GATT/LE (Web Bluetooth has no concept
+        // of BR/EDR at all), so there's no reason to discover via BR/EDR inquiry -- doing so
+        // just adds another way a dual-mode peripheral's Device1 object ends up associated
+        // with a BR/EDR-flavored discovery record. Note this alone doesn't pin connect() to
+        // LE: Device1.Connect() (see connect() below) is still the fully generic BlueZ method
+        // with no bearer parameter, so a dual-mode device could still end up BR/EDR-connected
+        // by BlueZ's own internal decision regardless of how it was discovered.
         let filter = DiscoveryFilter {
             service_uuids: filter.services,
             duplicate_data: Some(true),
-            transport: Some(Transport::Auto),
+            transport: Some(Transport::Le),
             ..Default::default()
         };
         self.session
