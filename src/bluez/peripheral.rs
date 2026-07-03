@@ -6,7 +6,6 @@ use bluez_async::{
 };
 use futures::future::{join_all, ready};
 use futures::stream::{Stream, StreamExt};
-use log::debug;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
@@ -188,17 +187,28 @@ impl api::Peripheral for Peripheral {
         // BR/EDR at all). This is a BlueZ `[experimental]` feature (see PreferredBearer's own
         // docs) and can fail on systems where experimental features aren't enabled; that's
         // expected and must never block or fail the actual connect below.
-        if let Err(e) = self
+        let preferred_bearer_error = if let Err(e) = self
             .session
             .set_preferred_bearer(&self.device, PreferredBearer::Le)
             .await
         {
-            debug!(
-                "set_preferred_bearer(Le) failed for {:?}, continuing anyway: {:?}",
-                self.device, e
-            );
+            Some(e)
+        } else {
+            None
+        };
+
+        if let Err(connect_error) = self.session.connect(&self.device).await {
+            if let Some(preferred_bearer_error) = preferred_bearer_error {
+                return Err(Error::Other(
+                    format!(
+                        "BlueZ Connect failed after PreferredBearer=le failed for {:?}: preferred_bearer_error={:?}; connect_error={:?}",
+                        self.device, preferred_bearer_error, connect_error
+                    )
+                    .into(),
+                ));
+            }
+            return Err(connect_error.into());
         }
-        self.session.connect(&self.device).await?;
         Ok(())
     }
 
