@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use bluez_async::{
     BluetoothError, BluetoothEvent, BluetoothSession, CharacteristicEvent, CharacteristicFlags,
     CharacteristicId, CharacteristicInfo, DescriptorInfo, DeviceId, DeviceInfo, MacAddress,
-    PreferredBearer, ServiceInfo, WriteOptions,
+    ServiceInfo, WriteOptions,
 };
 use futures::future::{join_all, ready};
 use futures::stream::{Stream, StreamExt};
@@ -197,18 +197,29 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn connect(&self) -> Result<()> {
-        // Best-effort: pin the bearer to LE before connecting, so a dual-mode (BR/EDR + LE)
-        // device doesn't end up connected via BR/EDR by BlueZ's own internal bearer-selection
-        // logic -- this project only ever cares about GATT/LE (Web Bluetooth has no concept of
-        // BR/EDR at all). This is a BlueZ `[experimental]` feature (see PreferredBearer's own
+        // Best-effort: force the LE/ATT connection path directly via Adapter1.ConnectDevice(),
+        // so a dual-mode (BR/EDR + LE) device doesn't end up connected via BR/EDR by BlueZ's
+        // own internal bearer-selection logic -- this project only ever cares about GATT/LE
+        // (Web Bluetooth has no concept of BR/EDR at all). This requires knowing the device's
+        // own LE AddressType (from its DeviceInfo, which BlueZ already derived from its LE
+        // advertisements during discovery); if that can't be fetched, there's nothing valid to
+        // force, so this is skipped entirely and the plain connect() below runs unmodified.
+        // This is a BlueZ `[experimental]` feature (unlike Device1's PreferredBearer property,
+        // it doesn't additionally require BlueZ to have already classified the device as
+        // dual-mode from prior discovery history -- see connect_device_with_address_type's own
         // docs) and can fail on systems where experimental features aren't enabled; that's
         // expected and must never block or fail the actual connect below.
-        let preferred_bearer_error = if let Err(e) = self
-            .session
-            .set_preferred_bearer(&self.device, PreferredBearer::Le)
-            .await
-        {
-            Some(e)
+        let address_type = self.device_info().await.ok().map(|info| info.address_type);
+
+        let connect_device_error = if let Some(address_type) = address_type {
+            match self
+                .session
+                .connect_device_with_address_type(&self.device, address_type)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => Some(e),
+            }
         } else {
             None
         };
@@ -245,11 +256,11 @@ impl api::Peripheral for Peripheral {
                                 }
                             }
                         }
-                        if let Some(preferred_bearer_error) = preferred_bearer_error {
+                        if let Some(connect_device_error) = connect_device_error {
                             return Err(Error::Other(
                                 format!(
-                                    "BlueZ Connect failed with transient bearer-state errors for {:?}: preferred_bearer_error={:?}; first_connect_error={:?}; retry_connect_error={:?}",
-                                    self.device, preferred_bearer_error, connect_error, retry_error
+                                    "BlueZ Connect failed with transient bearer-state errors for {:?}: connect_device_error={:?}; first_connect_error={:?}; retry_connect_error={:?}",
+                                    self.device, connect_device_error, connect_error, retry_error
                                 )
                                 .into(),
                             ));
@@ -258,11 +269,11 @@ impl api::Peripheral for Peripheral {
                     }
                 }
             }
-            if let Some(preferred_bearer_error) = preferred_bearer_error {
+            if let Some(connect_device_error) = connect_device_error {
                 return Err(Error::Other(
                     format!(
-                        "BlueZ Connect failed after PreferredBearer=le failed for {:?}: preferred_bearer_error={:?}; connect_error={:?}",
-                        self.device, preferred_bearer_error, connect_error
+                        "BlueZ Connect failed after ConnectDevice(LE) failed for {:?}: connect_device_error={:?}; connect_error={:?}",
+                        self.device, connect_device_error, connect_error
                     )
                     .into(),
                 ));
