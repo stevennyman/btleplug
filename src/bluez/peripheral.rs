@@ -6,7 +6,7 @@ use bluez_async::{
 };
 use futures::future::{join_all, ready};
 use futures::stream::{Stream, StreamExt};
-use log::debug;
+use log::{debug, warn};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
@@ -144,6 +144,13 @@ fn is_connection_unknown_error(error: &BluetoothError) -> bool {
         .unwrap_or(false)
 }
 
+fn log_connect_device_fallback_success(device: &DeviceId, connect_device_error: &BluetoothError) {
+    warn!(
+        "BlueZ ConnectDevice(LE) failed for {:?}: {:?}. Falling back to Device1.Connect() succeeded; resulting bearer may not be LE.",
+        device, connect_device_error
+    );
+}
+
 #[async_trait]
 impl api::Peripheral for Peripheral {
     fn id(&self) -> PeripheralId {
@@ -231,6 +238,9 @@ impl api::Peripheral for Peripheral {
             if is_connection_unknown_error(&connect_error) {
                 if let Ok(device_info) = self.device_info().await {
                     if device_info.connected {
+                        if let Some(connect_device_error) = &connect_device_error {
+                            log_connect_device_fallback_success(&self.device, connect_device_error);
+                        }
                         debug!(
                             "BlueZ Connect returned {:?} for {:?}, but device is connected; treating as success",
                             connect_error, self.device
@@ -243,11 +253,22 @@ impl api::Peripheral for Peripheral {
                     connect_error, self.device
                 );
                 match self.session.connect(&self.device).await {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        if let Some(connect_device_error) = &connect_device_error {
+                            log_connect_device_fallback_success(&self.device, connect_device_error);
+                        }
+                        return Ok(());
+                    }
                     Err(retry_error) => {
                         if is_connection_unknown_error(&retry_error) {
                             if let Ok(device_info) = self.device_info().await {
                                 if device_info.connected {
+                                    if let Some(connect_device_error) = &connect_device_error {
+                                        log_connect_device_fallback_success(
+                                            &self.device,
+                                            connect_device_error,
+                                        );
+                                    }
                                     debug!(
                                         "BlueZ Connect retry returned {:?} for {:?}, but device is connected; treating as success",
                                         retry_error, self.device
@@ -279,6 +300,9 @@ impl api::Peripheral for Peripheral {
                 ));
             }
             return Err(connect_error.into());
+        }
+        if let Some(connect_device_error) = &connect_device_error {
+            log_connect_device_fallback_success(&self.device, connect_device_error);
         }
         Ok(())
     }
