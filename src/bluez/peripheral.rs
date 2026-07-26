@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use bluez_async::{
     BluetoothError, BluetoothEvent, BluetoothSession, CharacteristicEvent, CharacteristicFlags,
     CharacteristicId, CharacteristicInfo, DescriptorInfo, DeviceId, DeviceInfo, MacAddress,
-    ServiceInfo, WriteOptions,
+    ServiceInfo, WriteOptions, PairingEvent as AsyncPairingEvent, PairingResponse as AsyncPairingResponse,
+    PairingOutcome as AsyncPairingOutcome,
 };
 use futures::future::{join_all, ready};
 use futures::stream::{Stream, StreamExt};
@@ -15,6 +16,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::{self, Display, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::api::{
@@ -129,6 +131,23 @@ impl Peripheral {
     }
 }
 
+/// True for BlueZ's own CTKD-driven BR/EDR side-connection failing on a dual-mode device (a
+/// known BlueZ behavior for devices that share an identity address across LE and BR/EDR, e.g.
+/// most iOS devices -- see https://github.com/hbldh/bleak/issues/1521 for another BlueZ client
+/// hitting the same thing). This connection is opened internally during pairing regardless of
+/// which method initiated the LE connection, so it can't be avoided by anything on our side; the
+/// GATT/LE session itself is otherwise fine, and a fresh connect attempt typically succeeds once
+/// this has played out and failed.
+fn is_bearer_race_error(error: &BluetoothError) -> bool {
+    let BluetoothError::DbusError(dbus_error) = error else {
+        return false;
+    };
+    dbus_error
+        .message()
+        .map(|message| message.to_ascii_lowercase().contains("br-connection-profile-unavailable"))
+        .unwrap_or(false)
+}
+
 fn is_connection_unknown_error(error: &BluetoothError) -> bool {
     let BluetoothError::DbusError(dbus_error) = error else {
         return false;
@@ -142,6 +161,18 @@ fn is_connection_unknown_error(error: &BluetoothError) -> bool {
                 || message.contains("connection-unknown")
         })
         .unwrap_or(false)
+}
+
+/// True for a fast method-dispatch rejection (experimental feature unsupported), not a
+/// device-specific failure.
+fn is_unsupported_method_error(error: &BluetoothError) -> bool {
+    let BluetoothError::DbusError(dbus_error) = error else {
+        return false;
+    };
+    matches!(
+        dbus_error.name(),
+        Some("org.freedesktop.DBus.Error.UnknownMethod") | Some("org.bluez.Error.NotSupported")
+    )
 }
 
 #[async_trait]
@@ -197,18 +228,6 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn connect(&self) -> Result<()> {
-        // Best-effort: force the LE/ATT connection path directly via Adapter1.ConnectDevice(),
-        // so a dual-mode (BR/EDR + LE) device doesn't end up connected via BR/EDR by BlueZ's
-        // own internal bearer-selection logic -- this project only ever cares about GATT/LE
-        // (Web Bluetooth has no concept of BR/EDR at all). This requires knowing the device's
-        // own LE AddressType (from its DeviceInfo, which BlueZ already derived from its LE
-        // advertisements during discovery); if that can't be fetched, there's nothing valid to
-        // force, so this is skipped entirely and the plain connect() below runs unmodified.
-        // This is a BlueZ `[experimental]` feature (unlike Device1's PreferredBearer property,
-        // it doesn't additionally require BlueZ to have already classified the device as
-        // dual-mode from prior discovery history -- see connect_device_with_address_type's own
-        // docs) and can fail on systems where experimental features aren't enabled; that's
-        // expected and must never block or fail the actual connect below.
         let address_type = self.device_info().await.ok().map(|info| info.address_type);
 
         let connect_device_error = if let Some(address_type) = address_type {
@@ -218,6 +237,21 @@ impl api::Peripheral for Peripheral {
                 .await
             {
                 Ok(()) => return Ok(()),
+
+                // ConnectDevice returns once the link is up; no need to call Connect() after.
+                Err(BluetoothError::ServiceDiscoveryTimedOut) => {
+                    if let Ok(device_info) = self.device_info().await {
+                        if device_info.connected && device_info.services_resolved {
+                            return Ok(());
+                        }
+                    }
+                    match self.session.await_service_discovery(&self.device).await {
+                        Ok(()) => return Ok(()),
+                        Err(e) => Some(e),
+                    }
+                }
+
+                Err(e) if is_unsupported_method_error(&e) => Some(e),
                 Err(e) => Some(e),
             }
         } else {
@@ -228,7 +262,7 @@ impl api::Peripheral for Peripheral {
             // BlueZ can sometimes report "*-connection-unknown" while racing its own
             // bearer-state bookkeeping; in that case, verify the actual connected
             // state and retry once before surfacing an error.
-            if is_connection_unknown_error(&connect_error) {
+            if is_connection_unknown_error(&connect_error) || is_bearer_race_error(&connect_error) {
                 if let Ok(device_info) = self.device_info().await {
                     if device_info.connected {
                         debug!(
@@ -245,7 +279,7 @@ impl api::Peripheral for Peripheral {
                 match self.session.connect(&self.device).await {
                     Ok(()) => return Ok(()),
                     Err(retry_error) => {
-                        if is_connection_unknown_error(&retry_error) {
+                        if is_connection_unknown_error(&retry_error) || is_bearer_race_error(&retry_error) {
                             if let Ok(device_info) = self.device_info().await {
                                 if device_info.connected {
                                     debug!(
@@ -285,6 +319,97 @@ impl api::Peripheral for Peripheral {
 
     async fn disconnect(&self) -> Result<()> {
         self.session.disconnect(&self.device).await?;
+        Ok(())
+    }
+
+    async fn pair(&self) -> Result<()> {
+        self.session
+            .pair_with_timeout(&self.device, Duration::from_secs(30))
+            .await?;
+        Ok(())
+    }
+
+    async fn pairing_requests(&self) -> Result<Pin<Box<dyn Stream<Item = api::PairingEvent> + Send>>> {
+        let device_id = self.device.clone();
+        let stream = self.session.pairing_events()
+            .filter(move |event| {
+                match event {
+                    AsyncPairingEvent::RequestConfirmation { device, .. } => device == &device_id,
+                    AsyncPairingEvent::RequestAuthorization { device, .. } => device == &device_id,
+                    AsyncPairingEvent::RequestPasskey { device, .. } => device == &device_id,
+                    AsyncPairingEvent::RequestPinCode { device, .. } => device == &device_id,
+                    AsyncPairingEvent::DisplayPasskey { device, .. } => device == &device_id,
+                    AsyncPairingEvent::Cancel { device, .. } => device == &device_id,
+                    AsyncPairingEvent::Outcome { device, .. } => device == &device_id,
+                }
+            })
+            .map(|event| {
+                match event {
+                    AsyncPairingEvent::RequestConfirmation { request_id, passkey, .. } => {
+                        api::PairingEvent::Request(api::PairingRequest {
+                            id: api::PairingRequestId(request_id.parse().unwrap_or(0)),
+                            kind: api::PairingRequestKind::ConfirmPinMatch(passkey.to_string()),
+                        })
+                    }
+                    AsyncPairingEvent::RequestAuthorization { request_id, .. } => {
+                        api::PairingEvent::Request(api::PairingRequest {
+                            id: api::PairingRequestId(request_id.parse().unwrap_or(0)),
+                            kind: api::PairingRequestKind::ConfirmOnly,
+                        })
+                    }
+                    AsyncPairingEvent::RequestPasskey { request_id, .. } => {
+                        api::PairingEvent::Request(api::PairingRequest {
+                            id: api::PairingRequestId(request_id.parse().unwrap_or(0)),
+                            kind: api::PairingRequestKind::ProvidePin,
+                        })
+                    }
+                    AsyncPairingEvent::RequestPinCode { request_id, .. } => {
+                        api::PairingEvent::Request(api::PairingRequest {
+                            id: api::PairingRequestId(request_id.parse().unwrap_or(0)),
+                            kind: api::PairingRequestKind::ProvidePin,
+                        })
+                    }
+                    AsyncPairingEvent::DisplayPasskey { request_id, passkey, .. } => {
+                        api::PairingEvent::Request(api::PairingRequest {
+                            id: api::PairingRequestId(request_id.parse().unwrap_or(0)),
+                            kind: api::PairingRequestKind::DisplayPin(passkey.to_string()),
+                        })
+                    }
+                    AsyncPairingEvent::Cancel { request_id, .. } => {
+                        api::PairingEvent::Outcome {
+                            id: api::PairingRequestId(request_id.parse().unwrap_or(0)),
+                            status: api::PairingOutcome::Canceled,
+                        }
+                    }
+                    AsyncPairingEvent::Outcome { request_id, status, .. } => {
+                        let status_mapped = match status {
+                            AsyncPairingOutcome::Success => api::PairingOutcome::Success,
+                            AsyncPairingOutcome::Failed => api::PairingOutcome::Failed,
+                            AsyncPairingOutcome::Canceled => api::PairingOutcome::Canceled,
+                            AsyncPairingOutcome::Timeout => api::PairingOutcome::Timeout,
+                        };
+                        api::PairingEvent::Outcome {
+                            id: api::PairingRequestId(request_id.parse().unwrap_or(0)),
+                            status: status_mapped,
+                        }
+                    }
+                }
+            });
+        Ok(Box::pin(stream))
+    }
+
+    async fn respond_to_pairing_request(
+        &self,
+        id: api::PairingRequestId,
+        response: api::PairingResponse,
+    ) -> Result<()> {
+        let response_mapped = match response {
+            api::PairingResponse::Accept => AsyncPairingResponse::Accept,
+            api::PairingResponse::Reject => AsyncPairingResponse::Reject,
+            api::PairingResponse::Pin(pin) => AsyncPairingResponse::Pin(pin),
+        };
+        let request_id = id.0.to_string();
+        self.session.respond_to_agent_request(&request_id, response_mapped);
         Ok(())
     }
 
